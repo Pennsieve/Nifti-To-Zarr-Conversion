@@ -1,0 +1,4 @@
+nibabel
+numpy
+zarr==2.*
+ome-zarr
