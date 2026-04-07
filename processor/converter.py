@@ -1,11 +1,15 @@
+import math
 import numpy as np
 import nibabel as nib
 import zarr
 from ome_zarr.writer import write_multiscales_metadata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Number of slices to load into RAM at once when writing level 0.
-# Lower = less memory, more I/O. 32 is a safe default.
 CHUNK_SLICES = 32
+MAX_WORKERS  = 8  # concurrent chunk writes
+
+def _write_chunk(arr, start, end, data):
+    arr[start:end, :, :] = data
 
 def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
     # 1. Load NIfTI and reorient to canonical (RAS) to ensure correct axis labels
@@ -19,7 +23,7 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
     # 2. Pre-create Zarr arrays for each pyramid level (no data yet)
     n_levels = 3
     level_shapes = [
-        tuple(max(1, s // (2 ** i)) for s in shape)
+        tuple(max(1, math.ceil(s / (2 ** i))) for s in shape)
         for i in range(n_levels)
     ]
     level_arrays = [
@@ -27,30 +31,44 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
             str(i),
             shape=level_shapes[i],
             dtype=np.float32,
-            chunks=(min(64, level_shapes[i][0]), min(64, level_shapes[i][1]), min(64, level_shapes[i][2])),
+            chunks=(min(CHUNK_SLICES, level_shapes[i][0]), min(64, level_shapes[i][1]), min(64, level_shapes[i][2])),
             overwrite=True,
         )
         for i in range(n_levels)
     ]
 
-    # 3. Stream level 0 slice-by-slice to avoid loading full volume into RAM
+    # 3. Stream level 0 slice-by-slice, writing chunks in parallel
     dim0 = shape[0]
-    for start in range(0, dim0, CHUNK_SLICES):
-        end = min(start + CHUNK_SLICES, dim0)
-        chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
-        level_arrays[0][start:end, :, :] = chunk
+    slices = [
+        (start, min(start + CHUNK_SLICES, dim0))
+        for start in range(0, dim0, CHUNK_SLICES)
+    ]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = []
+        for start, end in slices:
+            chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
+            futures.append(pool.submit(_write_chunk, level_arrays[0], start, end, chunk))
+        for f in as_completed(futures):
+            f.result()  # re-raises any exception from worker
 
-    # 4. Build lower pyramid levels from level 0 (already on disk, read back in chunks)
+    # 4. Build lower pyramid levels from level 0, also in parallel
     for lvl in range(1, n_levels):
         src = level_arrays[lvl - 1]
         dst = level_arrays[lvl]
         src_dim0 = src.shape[0]
-        for start in range(0, src_dim0, CHUNK_SLICES):
-            end = min(start + CHUNK_SLICES, src_dim0)
-            chunk = src[start:end:2, ::2, ::2]  # 2x downsample
-            dst_start = start // 2
-            dst_end = dst_start + chunk.shape[0]
-            dst[dst_start:dst_end, :, :] = chunk
+        src_slices = [
+            (start, min(start + CHUNK_SLICES, src_dim0))
+            for start in range(0, src_dim0, CHUNK_SLICES)
+        ]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = []
+            for start, end in src_slices:
+                chunk = src[start:end:2, ::2, ::2]  # 2x downsample
+                dst_start = start // 2
+                dst_end = dst_start + chunk.shape[0]
+                futures.append(pool.submit(_write_chunk, dst, dst_start, dst_end, chunk))
+            for f in as_completed(futures):
+                f.result()
 
     # 5. Write OME-Zarr multiscale metadata (no data, just .zattrs)
     datasets = []
