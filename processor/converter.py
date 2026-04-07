@@ -1,4 +1,5 @@
 import math
+import shutil
 import numpy as np
 import nibabel as nib
 import zarr
@@ -49,7 +50,7 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
             chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
             futures.append(pool.submit(_write_chunk, level_arrays[0], start, end, chunk))
         for f in as_completed(futures):
-            f.result()  # re-raises any exception from worker
+            f.result()
 
     # 4. Build lower pyramid levels from level 0, also in parallel
     for lvl in range(1, n_levels):
@@ -63,7 +64,7 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = []
             for start, end in src_slices:
-                chunk = src[start:end:2, ::2, ::2]  # 2x downsample
+                chunk = src[start:end:2, ::2, ::2]
                 dst_start = start // 2
                 dst_end = dst_start + chunk.shape[0]
                 futures.append(pool.submit(_write_chunk, dst, dst_start, dst_end, chunk))
@@ -89,3 +90,7 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
             {"name": "z", "type": "space", "unit": "millimeter"},
         ],
     )
+
+    # 6. Zip the .zarr directory and remove the unzipped original
+    shutil.make_archive(output_path, "zip", output_path)
+    shutil.rmtree(output_path)
