@@ -6,6 +6,9 @@ from converter import convert_nifti_to_ome_zarr
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger()
 
+VERSION = "1.2.0"  # bump this on every push
+log.info(f"nifti-to-zarr processor version {VERSION}")
+
 if __name__ == "__main__":
     config = Config()
 
