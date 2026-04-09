@@ -14,12 +14,6 @@ from processor.config import Config
 log = logging.getLogger(__name__)
 
 
-def _trim_to_even(arr: np.ndarray) -> np.ndarray:
-    """Trim array dimensions to even sizes for clean 2x downsampling."""
-    slices = tuple(slice(0, s - (s % 2)) for s in arr.shape)
-    return arr[slices]
-
-
 def _compute_num_levels(shape: tuple, min_dim: int, max_levels: int) -> int:
     """Compute number of pyramid levels based on smallest dimension."""
     smallest = min(shape)
@@ -124,9 +118,6 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
             futures = []
             for start, end in src_slices:
                 chunk = np.asarray(src[start:end, :, :])
-                chunk = _trim_to_even(chunk)
-                if chunk.size == 0:
-                    continue
                 downsampled = downscale_local_mean(chunk, (2, 2, 2))
                 dst_start = start // 2
                 dst_end = dst_start + downsampled.shape[0]
