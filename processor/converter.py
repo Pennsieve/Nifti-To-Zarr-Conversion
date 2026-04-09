@@ -1,96 +1,167 @@
 import math
-import shutil
+import logging
+
 import numpy as np
 import nibabel as nib
 import zarr
-from ome_zarr.writer import write_multiscales_metadata
+from zarr.storage import LocalStore
+from zarr.codecs import BloscCodec
+from skimage.transform import downscale_local_mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-CHUNK_SLICES = 32
-MAX_WORKERS  = 8  # concurrent chunk writes
+from processor.config import Config
+
+log = logging.getLogger(__name__)
+
+
+def _trim_to_even(arr: np.ndarray) -> np.ndarray:
+    """Trim array dimensions to even sizes for clean 2x downsampling."""
+    slices = tuple(slice(0, s - (s % 2)) for s in arr.shape)
+    return arr[slices]
+
+
+def _compute_num_levels(shape: tuple, min_dim: int, max_levels: int) -> int:
+    """Compute number of pyramid levels based on smallest dimension."""
+    smallest = min(shape)
+    auto_levels = 1
+    while smallest // (2 ** auto_levels) >= min_dim:
+        auto_levels += 1
+    # auto_levels is at least 1 (full resolution)
+    if max_levels > 0:
+        return min(auto_levels, max_levels)
+    return auto_levels
+
 
 def _write_chunk(arr, start, end, data):
     arr[start:end, :, :] = data
 
-def convert_nifti_to_ome_zarr(input_path: str, output_path: str) -> None:
-    # 1. Load NIfTI and reorient to canonical (RAS) to ensure correct axis labels
+
+def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config) -> None:
+    # 1. Load NIfTI and reorient to canonical (RAS+)
     img = nib.as_closest_canonical(nib.load(input_path))
-    voxel_sizes = img.header.get_zooms()  # (dim0, dim1, dim2) spacings — in RAS+ canonical form: dim0=x, dim1=y, dim2=z
-    shape = img.shape[:3]  # (dim0, dim1, dim2) — drop time dim if present
+    voxel_sizes = img.header.get_zooms()[:3]
+    shape = img.shape[:3]
 
-    store = zarr.open(output_path, mode="w")
-    root = store
+    idf = config.initial_downsample
+    if idf > 1:
+        shape = tuple(max(1, math.ceil(s / idf)) for s in shape)
+        voxel_sizes = tuple(v * idf for v in voxel_sizes)
+        log.info(f"Initial downsample factor {idf}: effective shape {shape}")
 
-    # 2. Pre-create Zarr arrays for each pyramid level (no data yet)
-    n_levels = 3
+    n_levels = _compute_num_levels(shape, config.min_dimension, config.max_levels)
+    log.info(f"Pyramid levels: {n_levels}, shape: {shape}")
+
+    # 2. Open Zarr v3 store
+    store = LocalStore(output_path)
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+
+    compressor = BloscCodec(cname=config.compression, clevel=config.compression_level)
+    tile = config.tile_size
+    chunk_slices = config.chunk_slices
+
+    # 3. Pre-create arrays for each pyramid level
     level_shapes = [
         tuple(max(1, math.ceil(s / (2 ** i))) for s in shape)
         for i in range(n_levels)
     ]
-    level_arrays = [
-        root.require_dataset(
+    level_arrays = []
+    for i in range(n_levels):
+        ls = level_shapes[i]
+        chunks = (min(chunk_slices, ls[0]), min(tile, ls[1]), min(tile, ls[2]))
+        arr = root.create_array(
             str(i),
-            shape=level_shapes[i],
+            shape=ls,
             dtype=np.float32,
-            chunks=(min(CHUNK_SLICES, level_shapes[i][0]), min(64, level_shapes[i][1]), min(64, level_shapes[i][2])),
-            overwrite=True,
+            chunks=chunks,
+            compressors=[compressor],
         )
-        for i in range(n_levels)
-    ]
+        level_arrays.append(arr)
 
-    # 3. Stream level 0 slice-by-slice, writing chunks in parallel
-    dim0 = shape[0]
-    slices = [
-        (start, min(start + CHUNK_SLICES, dim0))
-        for start in range(0, dim0, CHUNK_SLICES)
-    ]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = []
-        for start, end in slices:
-            chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
-            futures.append(pool.submit(_write_chunk, level_arrays[0], start, end, chunk))
-        for f in as_completed(futures):
-            f.result()
+    # 4. Stream level 0 from NIfTI
+    src_dim0 = img.shape[0]
+    if idf > 1:
+        # Read larger slabs and downsample
+        slices = [
+            (start, min(start + chunk_slices * idf, src_dim0))
+            for start in range(0, src_dim0, chunk_slices * idf)
+        ]
+        with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
+            futures = []
+            dst_offset = 0
+            for start, end in slices:
+                chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
+                chunk = downscale_local_mean(chunk, (idf, idf, idf))
+                dst_end = dst_offset + chunk.shape[0]
+                futures.append(pool.submit(_write_chunk, level_arrays[0], dst_offset, dst_end, chunk))
+                dst_offset = dst_end
+            for f in as_completed(futures):
+                f.result()
+    else:
+        slices = [
+            (start, min(start + chunk_slices, src_dim0))
+            for start in range(0, src_dim0, chunk_slices)
+        ]
+        with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
+            futures = []
+            for start, end in slices:
+                chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
+                futures.append(pool.submit(_write_chunk, level_arrays[0], start, end, chunk))
+            for f in as_completed(futures):
+                f.result()
 
-    # 4. Build lower pyramid levels from level 0, also in parallel
+    log.info("Level 0 written")
+
+    # 5. Build lower pyramid levels with quality downsampling
     for lvl in range(1, n_levels):
         src = level_arrays[lvl - 1]
         dst = level_arrays[lvl]
         src_dim0 = src.shape[0]
         src_slices = [
-            (start, min(start + CHUNK_SLICES, src_dim0))
-            for start in range(0, src_dim0, CHUNK_SLICES)
+            (start, min(start + chunk_slices, src_dim0))
+            for start in range(0, src_dim0, chunk_slices)
         ]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
             futures = []
             for start, end in src_slices:
-                chunk = src[start:end:2, ::2, ::2]
+                chunk = np.asarray(src[start:end, :, :])
+                chunk = _trim_to_even(chunk)
+                if chunk.size == 0:
+                    continue
+                downsampled = downscale_local_mean(chunk, (2, 2, 2))
                 dst_start = start // 2
-                dst_end = dst_start + chunk.shape[0]
-                futures.append(pool.submit(_write_chunk, dst, dst_start, dst_end, chunk))
+                dst_end = dst_start + downsampled.shape[0]
+                futures.append(pool.submit(_write_chunk, dst, dst_start, dst_end, downsampled))
             for f in as_completed(futures):
                 f.result()
+        log.info(f"Level {lvl} written: {dst.shape}")
 
-    # 5. Write OME-Zarr multiscale metadata (no data, just .zattrs)
+    # 6. Write OME-Zarr multiscale metadata
     datasets = []
     for i in range(n_levels):
-        factor = 2 ** i
         datasets.append({
             "path": str(i),
             "coordinateTransformations": [
-                {"type": "scale", "scale": [float(voxel_sizes[0]) * factor, float(voxel_sizes[1]) * factor, float(voxel_sizes[2]) * factor]}
+                {
+                    "type": "scale",
+                    "scale": [
+                        float(voxel_sizes[0]) * (2 ** i),
+                        float(voxel_sizes[1]) * (2 ** i),
+                        float(voxel_sizes[2]) * (2 ** i),
+                    ],
+                }
             ],
         })
-    write_multiscales_metadata(
-        group=root,
-        datasets=datasets,
-        axes=[
+
+    root.attrs["multiscales"] = [{
+        "version": "0.4",
+        "name": output_path,
+        "axes": [
             {"name": "x", "type": "space", "unit": "millimeter"},
             {"name": "y", "type": "space", "unit": "millimeter"},
             {"name": "z", "type": "space", "unit": "millimeter"},
         ],
-    )
+        "datasets": datasets,
+        "type": "downscale_local_mean",
+    }]
 
-    # 6. Zip the .zarr directory and remove the unzipped original
-    shutil.make_archive(output_path, "zip", output_path)
-    shutil.rmtree(output_path)
+    log.info(f"OME-Zarr metadata written ({n_levels} levels)")
