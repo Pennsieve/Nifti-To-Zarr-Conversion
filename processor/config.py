@@ -21,7 +21,7 @@ def get_config() -> Config:
         input_dir=os.environ.get("INPUT_DIR", "/inputs"),
         output_dir=os.environ.get("OUTPUT_DIR", "/outputs"),
         initial_downsample=int(os.environ.get("INITIAL_DOWNSAMPLE", "1")),
-        tile_size=int(os.environ.get("TILE_SIZE", "64")),
+        tile_size=int(os.environ.get("TILE_SIZE", "256")),
         compression=os.environ.get("COMPRESSION", "zstd"),
         compression_level=int(os.environ.get("COMPRESSION_LEVEL", "5")),
         max_levels=int(os.environ.get("MAX_LEVELS", "0")),

@@ -49,7 +49,7 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     store = LocalStore(output_path)
     root = zarr.open_group(store, mode="w", zarr_format=3)
 
-    compressor = BloscCodec(cname=config.compression, clevel=config.compression_level)
+    compressor = BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")
     tile = config.tile_size
     chunk_slices = config.chunk_slices
 
