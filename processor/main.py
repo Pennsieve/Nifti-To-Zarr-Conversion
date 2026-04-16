@@ -7,7 +7,7 @@ from processor.converter import convert_nifti_to_ome_zarr
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 def run():
@@ -26,8 +26,7 @@ def run():
 
     for input_path in input_files:
         log.info(f"Converting: {input_path}")
-        base = os.path.basename(input_path).replace('.nii.gz', '').replace('.nii', '')
-        output_path = os.path.join(config.output_dir, f"{base}.zarr")
+        output_path = config.output_dir
         convert_nifti_to_ome_zarr(input_path, output_path, config)
         log.info(f"Written: {output_path}")
 
