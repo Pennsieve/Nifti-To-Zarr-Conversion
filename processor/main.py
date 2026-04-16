@@ -7,7 +7,7 @@ from processor.converter import convert_nifti_to_ome_zarr
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 
 def run():
