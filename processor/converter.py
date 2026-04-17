@@ -35,6 +35,10 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     img = nib.as_closest_canonical(nib.load(input_path))
     voxel_sizes = img.header.get_zooms()[:3]
     shape = img.shape[:3]
+    # Collapse 4D time series (e.g. fMRI BOLD) to a 3D mean-over-time volume
+    is_4d = img.ndim == 4
+    if is_4d:
+        log.info(f"4D input detected ({img.shape[3]} timepoints); collapsing to mean over time")
 
     idf = config.initial_downsample
     if idf > 1:
@@ -84,6 +88,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
             dst_offset = 0
             for start, end in slices:
                 chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
+                if is_4d:
+                    chunk = chunk.mean(axis=3)
                 chunk = downscale_local_mean(chunk, (idf, idf, idf))
                 dst_end = dst_offset + chunk.shape[0]
                 futures.append(pool.submit(_write_chunk, level_arrays[0], dst_offset, dst_end, chunk))
@@ -99,6 +105,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
             futures = []
             for start, end in slices:
                 chunk = np.asarray(img.dataobj[start:end, :, :], dtype=np.float32)
+                if is_4d:
+                    chunk = chunk.mean(axis=3)
                 futures.append(pool.submit(_write_chunk, level_arrays[0], start, end, chunk))
             for f in as_completed(futures):
                 f.result()
