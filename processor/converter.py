@@ -35,6 +35,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     img = nib.as_closest_canonical(nib.load(input_path))
     voxel_sizes = img.header.get_zooms()[:3]
     shape = img.shape[:3]
+    spatial_unit, _ = img.header.get_xyzt_units()
+    log.info(f"NIfTI header voxel sizes (x,y,z): {tuple(float(v) for v in voxel_sizes)} {spatial_unit}")
     # Collapse 4D time series (e.g. fMRI BOLD) to a 3D mean-over-time volume
     is_4d = img.ndim == 4
     if is_4d:
@@ -44,7 +46,10 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     if idf > 1:
         shape = tuple(max(1, math.ceil(s / idf)) for s in shape)
         voxel_sizes = tuple(v * idf for v in voxel_sizes)
-        log.info(f"Initial downsample factor {idf}: effective shape {shape}")
+        log.info(
+            f"Initial downsample factor {idf}: effective shape {shape}, "
+            f"effective voxel sizes {tuple(float(v) for v in voxel_sizes)} {spatial_unit}"
+        )
 
     n_levels = _compute_num_levels(shape, config.min_dimension, config.max_levels)
     log.info(f"Pyramid levels: {n_levels}, shape: {shape}")
@@ -137,16 +142,18 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     # 6. Write OME-Zarr multiscale metadata
     datasets = []
     for i in range(n_levels):
+        level_scale = [
+            float(voxel_sizes[0]) * (2 ** i),
+            float(voxel_sizes[1]) * (2 ** i),
+            float(voxel_sizes[2]) * (2 ** i),
+        ]
+        log.info(f"Level {i} output voxel sizes (x,y,z): {tuple(level_scale)} {spatial_unit}")
         datasets.append({
             "path": str(i),
             "coordinateTransformations": [
                 {
                     "type": "scale",
-                    "scale": [
-                        float(voxel_sizes[0]) * (2 ** i),
-                        float(voxel_sizes[1]) * (2 ** i),
-                        float(voxel_sizes[2]) * (2 ** i),
-                    ],
+                    "scale": level_scale,
                 }
             ],
         })
