@@ -2,4 +2,5 @@ nibabel
 numpy
 zarr>=3,<4
 scikit-image
+indexed_gzip
 awslambdaric
