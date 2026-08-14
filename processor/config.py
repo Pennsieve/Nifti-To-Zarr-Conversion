@@ -14,6 +14,7 @@ class Config:
     min_dimension: int
     chunk_slices: int
     max_workers: int
+    memory_budget_gb: float
 
 
 def get_config() -> Config:
@@ -28,4 +29,5 @@ def get_config() -> Config:
         min_dimension=int(os.environ.get("MIN_DIMENSION", "64")),
         chunk_slices=int(os.environ.get("CHUNK_SLICES", "32")),
         max_workers=int(os.environ.get("MAX_WORKERS", "8")),
+        memory_budget_gb=float(os.environ.get("MEMORY_BUDGET_GB", "16")),
     )

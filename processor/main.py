@@ -2,12 +2,12 @@ import os
 import logging
 
 from processor.config import get_config
-from processor.converter import convert_nifti_to_ome_zarr
+from processor.converter import convert_nifti_to_ome_zarr, _HAS_INDEXED_GZIP
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 
 def run():
@@ -15,6 +15,10 @@ def run():
 
     log.info(f"nifti-to-zarr processor version {VERSION}")
     log.info(f"Config: {config}")
+    log.info(
+        f"indexed_gzip: {'available' if _HAS_INDEXED_GZIP else 'NOT INSTALLED'}"
+        f"{' (will use keep_file_open=True for .nii.gz)' if _HAS_INDEXED_GZIP else ' (WARNING: O(n^2) gzip decompression for .nii.gz)'}"
+    )
 
     input_files = [
         f.path for f in os.scandir(config.input_dir)
