@@ -15,6 +15,7 @@ class Config:
     chunk_slices: int
     max_workers: int
     memory_budget_gb: float
+    overhead_reserve_gb: float
 
 
 def get_config() -> Config:
@@ -30,4 +31,5 @@ def get_config() -> Config:
         chunk_slices=int(os.environ.get("CHUNK_SLICES", "32")),
         max_workers=int(os.environ.get("MAX_WORKERS", "8")),
         memory_budget_gb=float(os.environ.get("MEMORY_BUDGET_GB", "16")),
+        overhead_reserve_gb=float(os.environ.get("OVERHEAD_RESERVE_GB", "2")),
     )
