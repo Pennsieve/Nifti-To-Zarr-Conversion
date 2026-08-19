@@ -1,6 +1,8 @@
+import gc
 import gzip
 import math
 import logging
+import os
 import resource
 import sys
 import threading
@@ -107,9 +109,14 @@ def _compute_slab_bytes(chunk_slices, shape, on_disk_dtype, has_scaling):
     return voxels * bytes_per_voxel
 
 
-def _compute_max_in_flight(budget_gb, slab_bytes):
-    """Derive in-flight bound from a memory budget and per-slab size."""
-    budget_bytes = int(budget_gb * (1024 ** 3))
+def _compute_max_in_flight(budget_gb, slab_bytes, overhead_reserve_gb=0.0):
+    """Derive in-flight bound from a memory budget and per-slab size.
+
+    Subtracts overhead_reserve_gb (indexed_gzip index, Python/zarr overhead,
+    compression buffers) before computing how many slabs fit.
+    """
+    effective_gb = max(budget_gb - overhead_reserve_gb, 0.5)
+    budget_bytes = int(effective_gb * (1024 ** 3))
     n = max(1, budget_bytes // slab_bytes)
     return n
 
@@ -237,6 +244,43 @@ def _read_slab_reoriented(dataobj, ornt, src_axis, slab_start, slab_end,
     return np.asarray(slab, dtype=output_dtype)
 
 
+def _read_slab_with_retry(dataobj, ornt, src_axis, slab_start, slab_end,
+                           transpose_order, output_dtype, input_path,
+                           max_retries=2):
+    """Read a slab with retry on indexed_gzip / ZranError failures."""
+    last_exc = None
+    for attempt in range(1 + max_retries):
+        try:
+            result = _read_slab_reoriented(
+                dataobj, ornt, src_axis, slab_start, slab_end,
+                transpose_order, output_dtype,
+            )
+            if attempt > 0:
+                log.info(
+                    f"Slab read succeeded on attempt {attempt + 1}/{1 + max_retries}: "
+                    f"slab=[{slab_start}:{slab_end}]"
+                )
+            return result
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            # Retry on indexed_gzip errors (ZranError, etc.)
+            if "Zran" in exc_name or "indexed_gzip" in type(exc).__module__:
+                last_exc = exc
+                if attempt < max_retries:
+                    log.warning(
+                        f"Slab read failed (attempt {attempt + 1}/{1 + max_retries}): "
+                        f"{exc_name}: {exc} — file={input_path}, "
+                        f"slab=[{slab_start}:{slab_end}], retrying in 1s"
+                    )
+                    time.sleep(1)
+                    continue
+            raise
+    raise RuntimeError(
+        f"Slab read failed after {1 + max_retries} attempts: "
+        f"file={input_path}, slab=[{slab_start}:{slab_end}]"
+    ) from last_exc
+
+
 def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config) -> None:
     phase_start = time.monotonic()
 
@@ -258,9 +302,14 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     spatial_unit, _ = raw_img.header.get_xyzt_units()
     voxel_sizes = raw_img.header.get_zooms()[:3]
 
+    file_size_mb = os.path.getsize(input_path) / (1024 ** 2)
+    total_voxels = 1
+    for s in on_disk_shape[:3]:
+        total_voxels *= s
     log.info(
         f"Load: shape={on_disk_shape}, ndim={ndim}, dtype={on_disk_dtype}, "
         f"compressed={compressed}, indexed_gzip={_HAS_INDEXED_GZIP}, "
+        f"file_size={file_size_mb:.1f}MB, total_voxels={total_voxels:,}, "
         f"load_time={t_load:.2f}s, RSS={_rss_mb():.0f}MB"
     )
     log.info(
@@ -354,10 +403,15 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     slab_bytes = _compute_slab_bytes(
         chunk_slices, reoriented_shape, on_disk_dtype, has_scaling,
     )
-    max_in_flight = _compute_max_in_flight(config.memory_budget_gb, slab_bytes)
+    max_in_flight = _compute_max_in_flight(
+        config.memory_budget_gb, slab_bytes, config.overhead_reserve_gb,
+    )
+    effective_gb = max(config.memory_budget_gb - config.overhead_reserve_gb, 0.5)
     theoretical_peak_mb = max_in_flight * slab_bytes / (1024 ** 2)
     log.info(
         f"Memory budget: {config.memory_budget_gb}GB, "
+        f"overhead_reserve={config.overhead_reserve_gb}GB, "
+        f"effective_budget={effective_gb:.1f}GB, "
         f"slab_bytes={slab_bytes / (1024**2):.1f}MB "
         f"(scaling={'float64+float32' if has_scaling else f'{on_disk_dtype}+float32'}), "
         f"max_in_flight={max_in_flight}, "
@@ -403,11 +457,21 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     src_len = on_disk_shape[src_axis]
     out_dim0 = shape[0]  # output axis-0 size (after any initial_downsample)
     semaphore = threading.Semaphore(max_in_flight)
+    total_slabs = math.ceil(out_dim0 / chunk_slices)
+    log.info(f"Level 0: streaming {total_slabs} slabs (chunk_slices={chunk_slices})")
 
     if idf > 1:
         with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
             futures = []
+            slab_idx = 0
+            last_progress_time = t0
             for out_start in range(0, out_dim0, chunk_slices):
+                # Early error detection: fail fast if a write already failed
+                for f in futures:
+                    if f.done() and f.exception() is not None:
+                        log.error(f"Level 0: write failure detected at slab {slab_idx}/{total_slabs}, failing fast")
+                        raise f.exception()
+
                 out_end = min(out_start + chunk_slices, out_dim0)
                 # Map output chunk back to input range
                 in_start = out_start * idf
@@ -417,9 +481,9 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                     in_end_f = src_len - in_start
                     in_start, in_end = in_start_f, in_end_f
 
-                slab = _read_slab_reoriented(
+                slab = _read_slab_with_retry(
                     raw_img.dataobj, spatial_ornt, src_axis, in_start, in_end,
-                    transpose_order, output_dtype,
+                    transpose_order, output_dtype, input_path,
                 )
                 if is_4d:
                     slab = slab.mean(axis=3)
@@ -429,11 +493,30 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                 slicing = (slice(out_start, dst_end), slice(None), slice(None))
                 f = _submit_bounded(pool, semaphore, _write_chunk, guard, level_arrays[0], slicing, slab)
                 futures.append(f)
+                slab_idx += 1
+
+                now = time.monotonic()
+                if now - last_progress_time >= 30:
+                    elapsed = now - t0
+                    log.info(
+                        f"Level 0 progress: slab {slab_idx}/{total_slabs} "
+                        f"({100 * slab_idx / total_slabs:.0f}%), "
+                        f"elapsed={elapsed:.0f}s, RSS={_rss_mb():.0f}MB"
+                    )
+                    last_progress_time = now
             _drain_futures(futures)
     else:
         with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
             futures = []
+            slab_idx = 0
+            last_progress_time = t0
             for out_start in range(0, out_dim0, chunk_slices):
+                # Early error detection: fail fast if a write already failed
+                for f in futures:
+                    if f.done() and f.exception() is not None:
+                        log.error(f"Level 0: write failure detected at slab {slab_idx}/{total_slabs}, failing fast")
+                        raise f.exception()
+
                 out_end = min(out_start + chunk_slices, out_dim0)
                 # Map output chunk back to input range
                 if src_flip:
@@ -443,9 +526,9 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                     in_start = out_start
                     in_end = out_end
 
-                slab = _read_slab_reoriented(
+                slab = _read_slab_with_retry(
                     raw_img.dataobj, spatial_ornt, src_axis, in_start, in_end,
-                    transpose_order, output_dtype,
+                    transpose_order, output_dtype, input_path,
                 )
                 if is_4d:
                     slab = slab.mean(axis=3)
@@ -453,10 +536,27 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                 slicing = (slice(out_start, out_end), slice(None), slice(None))
                 f = _submit_bounded(pool, semaphore, _write_chunk, guard, level_arrays[0], slicing, slab)
                 futures.append(f)
+                slab_idx += 1
+
+                now = time.monotonic()
+                if now - last_progress_time >= 30:
+                    elapsed = now - t0
+                    log.info(
+                        f"Level 0 progress: slab {slab_idx}/{total_slabs} "
+                        f"({100 * slab_idx / total_slabs:.0f}%), "
+                        f"elapsed={elapsed:.0f}s, RSS={_rss_mb():.0f}MB"
+                    )
+                    last_progress_time = now
             _drain_futures(futures)
 
     t_level0 = time.monotonic() - t0
     log.info(f"Level 0 written: time={t_level0:.1f}s, RSS={_rss_mb():.0f}MB")
+
+    # Release nibabel image to free indexed_gzip seek index + file handle
+    rss_before = _rss_mb()
+    del raw_img
+    gc.collect()
+    log.info(f"Released NIfTI image: RSS {rss_before:.0f}MB -> {_rss_mb():.0f}MB")
 
     # 5. Build lower pyramid levels with quality downsampling
     #
@@ -522,4 +622,15 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
     }]
 
     total_time = time.monotonic() - phase_start
-    log.info(f"OME-Zarr metadata written ({n_levels} levels), total_time={total_time:.1f}s, RSS={_rss_mb():.0f}MB")
+    peak_rss = _rss_mb()
+    budget_mb = config.memory_budget_gb * 1024
+    rss_pct = 100 * peak_rss / budget_mb if budget_mb > 0 else 0
+    log.info(
+        f"Done: {n_levels} levels, total_time={total_time:.1f}s, "
+        f"peak_RSS={peak_rss:.0f}MB, budget={budget_mb:.0f}MB ({rss_pct:.0f}% used)"
+    )
+    if peak_rss > budget_mb:
+        log.warning(
+            f"Peak RSS ({peak_rss:.0f}MB) exceeded memory budget ({budget_mb:.0f}MB). "
+            f"Consider increasing MEMORY_BUDGET_GB or OVERHEAD_RESERVE_GB."
+        )

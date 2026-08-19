@@ -125,6 +125,7 @@ def _convert_new(input_path, output_path, chunk_slices=32, tile=256,
         max_levels=0, min_dimension=64,
         chunk_slices=chunk_slices, max_workers=max_workers,
         memory_budget_gb=memory_budget_gb,
+        overhead_reserve_gb=0.0,
     )
     convert_nifti_to_ome_zarr(input_path, output_path, config)
     from zarr.storage import LocalStore
@@ -563,6 +564,7 @@ def test_full_conversion_error_propagation(tmpdir):
         max_levels=0, min_dimension=64,
         chunk_slices=4, max_workers=2,
         memory_budget_gb=1.0,
+        overhead_reserve_gb=0.0,
     )
 
     output_path = os.path.join(tmpdir, "error_test.zarr")
