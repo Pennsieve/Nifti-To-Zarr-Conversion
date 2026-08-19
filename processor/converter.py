@@ -244,23 +244,29 @@ def _read_slab_reoriented(dataobj, ornt, src_axis, slab_start, slab_end,
     return np.asarray(slab, dtype=output_dtype)
 
 
-def _read_slab_with_retry(dataobj, ornt, src_axis, slab_start, slab_end,
+def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                            transpose_order, output_dtype, input_path,
                            max_retries=2):
-    """Read a slab with retry on indexed_gzip / ZranError failures."""
+    """Read a slab with retry on indexed_gzip / ZranError failures.
+
+    On ZranError, reopens the file to get a fresh indexed_gzip handle
+    (the old handle's seek index is poisoned after a read failure).
+    Returns (slab_data, raw_img) — raw_img may be a new object if
+    the file was reopened.
+    """
     last_exc = None
     for attempt in range(1 + max_retries):
         try:
             result = _read_slab_reoriented(
-                dataobj, ornt, src_axis, slab_start, slab_end,
+                raw_img.dataobj, ornt, src_axis, slab_start, slab_end,
                 transpose_order, output_dtype,
             )
             if attempt > 0:
                 log.info(
-                    f"Slab read succeeded on attempt {attempt + 1}/{1 + max_retries}: "
-                    f"slab=[{slab_start}:{slab_end}]"
+                    f"Slab read succeeded on retry (attempt {attempt + 1}/{1 + max_retries}): "
+                    f"slab=[{slab_start}:{slab_end}], RSS={_rss_mb():.0f}MB"
                 )
-            return result
+            return result, raw_img
         except Exception as exc:
             exc_name = type(exc).__name__
             # Retry on indexed_gzip errors (ZranError, etc.)
@@ -270,13 +276,25 @@ def _read_slab_with_retry(dataobj, ornt, src_axis, slab_start, slab_end,
                     log.warning(
                         f"Slab read failed (attempt {attempt + 1}/{1 + max_retries}): "
                         f"{exc_name}: {exc} — file={input_path}, "
-                        f"slab=[{slab_start}:{slab_end}], retrying in 1s"
+                        f"slab=[{slab_start}:{slab_end}], "
+                        f"reopening file with fresh indexed_gzip handle"
+                    )
+                    rss_before = _rss_mb()
+                    del raw_img
+                    gc.collect()
+                    log.info(
+                        f"Released old handle: RSS {rss_before:.0f}MB -> {_rss_mb():.0f}MB"
+                    )
+                    raw_img = _load_image(input_path)
+                    log.info(
+                        f"Reopened file: RSS={_rss_mb():.0f}MB, "
+                        f"retrying slab=[{slab_start}:{slab_end}] in 1s"
                     )
                     time.sleep(1)
                     continue
             raise
     raise RuntimeError(
-        f"Slab read failed after {1 + max_retries} attempts: "
+        f"Slab read failed after {1 + max_retries} attempts with fresh handles: "
         f"file={input_path}, slab=[{slab_start}:{slab_end}]"
     ) from last_exc
 
@@ -481,8 +499,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                     in_end_f = src_len - in_start
                     in_start, in_end = in_start_f, in_end_f
 
-                slab = _read_slab_with_retry(
-                    raw_img.dataobj, spatial_ornt, src_axis, in_start, in_end,
+                slab, raw_img = _read_slab_with_retry(
+                    raw_img, spatial_ornt, src_axis, in_start, in_end,
                     transpose_order, output_dtype, input_path,
                 )
                 if is_4d:
@@ -526,8 +544,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
                     in_start = out_start
                     in_end = out_end
 
-                slab = _read_slab_with_retry(
-                    raw_img.dataobj, spatial_ornt, src_axis, in_start, in_end,
+                slab, raw_img = _read_slab_with_retry(
+                    raw_img, spatial_ornt, src_axis, in_start, in_end,
                     transpose_order, output_dtype, input_path,
                 )
                 if is_4d:
