@@ -244,6 +244,37 @@ def _read_slab_reoriented(dataobj, ornt, src_axis, slab_start, slab_end,
     return np.asarray(slab, dtype=output_dtype)
 
 
+def _reopen_image(input_path, max_attempts=3, base_delay=5):
+    """Reopen a NIfTI image with retries for transient EFS/NFS errors.
+
+    EFS under contention can return PermissionError or OSError on stat/open.
+    These are transient — retry with exponential backoff.
+    """
+    for attempt in range(max_attempts):
+        try:
+            img = _load_image(input_path)
+            if attempt > 0:
+                log.info(
+                    f"File reopen succeeded on attempt {attempt + 1}/{max_attempts}: "
+                    f"file={input_path}"
+                )
+            return img
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            if attempt < max_attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    f"File reopen failed (attempt {attempt + 1}/{max_attempts}): "
+                    f"{type(exc).__name__}: {exc} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+            else:
+                log.error(
+                    f"File reopen failed after {max_attempts} attempts: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+
+
 def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                            transpose_order, output_dtype, input_path,
                            max_retries=2):
@@ -285,12 +316,12 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                     log.info(
                         f"Released old handle: RSS {rss_before:.0f}MB -> {_rss_mb():.0f}MB"
                     )
-                    raw_img = _load_image(input_path)
+                    raw_img = _reopen_image(input_path)
                     log.info(
                         f"Reopened file: RSS={_rss_mb():.0f}MB, "
-                        f"retrying slab=[{slab_start}:{slab_end}] in 1s"
+                        f"retrying slab=[{slab_start}:{slab_end}] in 5s"
                     )
-                    time.sleep(1)
+                    time.sleep(5)
                     continue
             raise
     raise RuntimeError(
