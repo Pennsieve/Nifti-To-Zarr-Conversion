@@ -244,11 +244,12 @@ def _read_slab_reoriented(dataobj, ornt, src_axis, slab_start, slab_end,
     return np.asarray(slab, dtype=output_dtype)
 
 
-def _reopen_image(input_path, max_attempts=3, base_delay=5):
+def _reopen_image(input_path, max_attempts=6, base_delay=5):
     """Reopen a NIfTI image with retries for transient EFS/NFS errors.
 
     EFS under contention can return PermissionError or OSError on stat/open.
-    These are transient — retry with exponential backoff.
+    These are transient — retry with exponential backoff (capped at 60s).
+    Total budget: ~3 minutes (5 + 10 + 20 + 40 + 60 = 135s).
     """
     for attempt in range(max_attempts):
         try:
@@ -261,7 +262,7 @@ def _reopen_image(input_path, max_attempts=3, base_delay=5):
             return img
         except (PermissionError, FileNotFoundError, OSError) as exc:
             if attempt < max_attempts - 1:
-                delay = base_delay * (2 ** attempt)
+                delay = min(base_delay * (2 ** attempt), 60)
                 log.warning(
                     f"File reopen failed (attempt {attempt + 1}/{max_attempts}): "
                     f"{type(exc).__name__}: {exc} — retrying in {delay}s"
@@ -277,16 +278,43 @@ def _reopen_image(input_path, max_attempts=3, base_delay=5):
 
 def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                            transpose_order, output_dtype, input_path,
-                           max_retries=2):
+                           max_retries=3):
     """Read a slab with retry on indexed_gzip / ZranError failures.
 
     On ZranError, reopens the file to get a fresh indexed_gzip handle
     (the old handle's seek index is poisoned after a read failure).
+    If the reopen itself fails (EFS contention), the attempt is consumed
+    and the next attempt tries reopening again before reading.
     Returns (slab_data, raw_img) — raw_img may be a new object if
     the file was reopened.
     """
     last_exc = None
+    need_reopen = False
     for attempt in range(1 + max_retries):
+        # Reopen the file if the previous attempt poisoned the handle
+        if need_reopen:
+            try:
+                raw_img = _reopen_image(input_path)
+                need_reopen = False
+                log.info(
+                    f"Reopened file: RSS={_rss_mb():.0f}MB, "
+                    f"retrying slab=[{slab_start}:{slab_end}] in 5s"
+                )
+                time.sleep(5)
+            except Exception as reopen_exc:
+                log.warning(
+                    f"Reopen failed (attempt {attempt + 1}/{1 + max_retries}): "
+                    f"{type(reopen_exc).__name__}: {reopen_exc}"
+                )
+                last_exc = reopen_exc
+                if attempt < max_retries:
+                    continue
+                raise RuntimeError(
+                    f"Slab read failed after {1 + max_retries} attempts — "
+                    f"could not reopen file: file={input_path}, "
+                    f"slab=[{slab_start}:{slab_end}]"
+                ) from last_exc
+
         try:
             result = _read_slab_reoriented(
                 raw_img.dataobj, ornt, src_axis, slab_start, slab_end,
@@ -300,7 +328,6 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
             return result, raw_img
         except Exception as exc:
             exc_name = type(exc).__name__
-            # Retry on indexed_gzip errors (ZranError, etc.)
             if "Zran" in exc_name or "indexed_gzip" in type(exc).__module__:
                 last_exc = exc
                 if attempt < max_retries:
@@ -316,12 +343,7 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                     log.info(
                         f"Released old handle: RSS {rss_before:.0f}MB -> {_rss_mb():.0f}MB"
                     )
-                    raw_img = _reopen_image(input_path)
-                    log.info(
-                        f"Reopened file: RSS={_rss_mb():.0f}MB, "
-                        f"retrying slab=[{slab_start}:{slab_end}] in 5s"
-                    )
-                    time.sleep(5)
+                    need_reopen = True
                     continue
             raise
     raise RuntimeError(
