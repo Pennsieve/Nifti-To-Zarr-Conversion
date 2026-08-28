@@ -293,14 +293,15 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
     for attempt in range(1 + max_retries):
         # Reopen the file if the previous attempt poisoned the handle
         if need_reopen:
+            read_delay = min(5 * (2 ** (attempt - 1)), 30)
             try:
                 raw_img = _reopen_image(input_path)
                 need_reopen = False
                 log.info(
                     f"Reopened file: RSS={_rss_mb():.0f}MB, "
-                    f"retrying slab=[{slab_start}:{slab_end}] in 5s"
+                    f"retrying slab=[{slab_start}:{slab_end}] in {read_delay}s"
                 )
-                time.sleep(5)
+                time.sleep(read_delay)
             except Exception as reopen_exc:
                 log.warning(
                     f"Reopen failed (attempt {attempt + 1}/{1 + max_retries}): "
@@ -309,6 +310,12 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                 last_exc = reopen_exc
                 if attempt < max_retries:
                     continue
+                log.error(
+                    f"Slab read failed after {1 + max_retries} attempts — "
+                    f"could not reopen file: file={input_path}, "
+                    f"slab=[{slab_start}:{slab_end}]. "
+                    f"The file on EFS may be inaccessible or corrupted and may need to be re-uploaded."
+                )
                 raise RuntimeError(
                     f"Slab read failed after {1 + max_retries} attempts — "
                     f"could not reopen file: file={input_path}, "
@@ -346,6 +353,11 @@ def _read_slab_with_retry(raw_img, ornt, src_axis, slab_start, slab_end,
                     need_reopen = True
                     continue
             raise
+    log.error(
+        f"Slab read failed after {1 + max_retries} attempts with fresh handles: "
+        f"file={input_path}, slab=[{slab_start}:{slab_end}]. "
+        f"The file data on EFS may be corrupted and may need to be re-uploaded."
+    )
     raise RuntimeError(
         f"Slab read failed after {1 + max_retries} attempts with fresh handles: "
         f"file={input_path}, slab=[{slab_start}:{slab_end}]"
