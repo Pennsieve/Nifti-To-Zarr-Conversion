@@ -307,6 +307,36 @@ def test_dtype_equivalence(tmpdir):
     return failed == 0
 
 
+def test_spatial_units(tmpdir):
+    """Axis units come from the NIfTI header (unknown falls back to millimeter)."""
+    print("\n" + "=" * 60)
+    print("TEST: spatial units from header")
+    print("=" * 60)
+
+    vol = make_volume((16, 20, 24), np.uint16)
+    passed = failed = 0
+    for nifti_unit, expected in [("mm", "millimeter"), ("micron", "micrometer"),
+                                 ("meter", "meter"), ("unknown", "millimeter")]:
+        img = nib.Nifti1Image(vol, np.diag([0.5, 0.5, 2.0, 1.0]))
+        img.header.set_xyzt_units(xyz=nifti_unit)
+        nii_path = os.path.join(tmpdir, f"units_{nifti_unit}.nii.gz")
+        nib.save(img, nii_path)
+        out_path = os.path.join(tmpdir, f"units_{nifti_unit}.zarr")
+        root = _convert_new(nii_path, out_path, chunk_slices=4)
+        ms = root.attrs["multiscales"][0]
+        units = {a["unit"] for a in ms["axes"]}
+        scale0 = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
+        if units == {expected} and np.allclose(scale0, [0.5, 0.5, 2.0]):
+            passed += 1
+        else:
+            print(f"  FAIL {nifti_unit}: units={units} scale0={scale0}")
+            failed += 1
+        shutil.rmtree(out_path, ignore_errors=True)
+
+    print(f"  {passed} passed, {failed} failed")
+    return failed == 0
+
+
 def test_initial_downsample(tmpdir):
     """Test initial_downsample > 1 with non-canonical orientation."""
     print("\n" + "=" * 60)
@@ -611,6 +641,7 @@ def main():
         results.append(("4D equivalence", test_4d_equivalence(tmpdir)))
         results.append(("dtype equivalence", test_dtype_equivalence(tmpdir)))
         results.append(("initial_downsample", test_initial_downsample(tmpdir)))
+        results.append(("spatial units", test_spatial_units(tmpdir)))
         results.append(("ndim rejection", test_unsupported_ndim(tmpdir)))
         results.append(("error propagation", test_bounded_queue_error_propagation(tmpdir)))
         results.append(("pyramid race", test_pyramid_race(tmpdir)))

@@ -48,6 +48,26 @@ else:
     )
 
 
+# NIfTI xyzt_units (as nibabel names them) -> OME-Zarr axis unit.
+NIFTI_TO_OME_UNIT = {"meter": "meter", "mm": "millimeter", "micron": "micrometer"}
+
+
+def _ome_spatial_unit(nifti_unit):
+    """OME-Zarr unit for the NIfTI header's spatial unit.
+
+    "unknown" (unit code 0) falls back to millimeter, the NIfTI/ANALYZE
+    convention most tools assume, with a warning.
+    """
+    unit = NIFTI_TO_OME_UNIT.get(nifti_unit)
+    if unit is None:
+        log.warning(
+            f"NIfTI header spatial unit is '{nifti_unit}'; labeling the axes millimeter "
+            f"(the NIfTI default). The scale bar is only right if the voxel sizes are in mm."
+        )
+        unit = "millimeter"
+    return unit
+
+
 def _rss_mb():
     """Current max RSS in MB."""
     val = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -674,6 +694,8 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
         log.info(f"Level {lvl} written: shape={dst.shape}, time={t_lvl:.1f}s, RSS={_rss_mb():.0f}MB")
 
     # 6. Write OME-Zarr multiscale metadata
+    # Axis unit from the header (it was always "millimeter" before, whatever the header said).
+    ome_unit = _ome_spatial_unit(spatial_unit)
     datasets = []
     for i in range(n_levels):
         level_scale = [
@@ -696,9 +718,9 @@ def convert_nifti_to_ome_zarr(input_path: str, output_path: str, config: Config)
         "version": "0.4",
         "name": output_path,
         "axes": [
-            {"name": "x", "type": "space", "unit": "millimeter"},
-            {"name": "y", "type": "space", "unit": "millimeter"},
-            {"name": "z", "type": "space", "unit": "millimeter"},
+            {"name": "x", "type": "space", "unit": ome_unit},
+            {"name": "y", "type": "space", "unit": ome_unit},
+            {"name": "z", "type": "space", "unit": ome_unit},
         ],
         "datasets": datasets,
         "type": "downscale_local_mean",
